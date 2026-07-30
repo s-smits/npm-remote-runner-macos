@@ -106,7 +106,9 @@ Scope each configured entry to one canonical worktree root. If the user opts int
 accept another path only when its Git common directory matches the selected repository and
 `git worktree list` names it as a registered worktree. This supports Claude Code worktrees under
 temporary directories and Codex worktrees under its personal data directory without trusting those
-path prefixes. Give every accepted worktree its own remote directory and lock.
+path prefixes. Give every accepted worktree its own remote source slot and local lock. Share only
+dependency caches across worktrees with the same repository identity and exact dependency identity;
+otherwise a repository with 20 temporary worktrees quietly grows 20 `node_modules` trees.
 
 A nested Git repository must resolve to itself and therefore remain outside the parent route.
 Submodules may be test inputs, but do not inherit routing automatically.
@@ -136,7 +138,9 @@ Do not open, print, log, commit or transfer:
 
 Tracked public templates such as `.env.example`, `.env.sample` and `.env.template` may be synced. A
 tracked project `.npmrc` may be synced only when it contains public settings or variable
-placeholders instead of literal credentials.
+placeholders instead of literal credentials. The baseline fails closed on every tracked `.npmrc`.
+Set `REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC=1` only after the user has classified every tracked
+`.npmrc` as public. The files then enter both the source-tree proof and dependency-cache identity.
 
 Do not pass secrets to remote tests by default. Discover required variable names from public
 templates and source configuration. If a test needs a secret, report the name and stop for the
@@ -168,7 +172,18 @@ For every configured worktree:
 
 Never copy `node_modules`. Derive a dependency identity from the operating system, architecture,
 exact Node and package-manager versions, manifests, lockfiles and public package configuration. Use
-the package manager's clean frozen install when the identity changes or validation fails.
+the package manager's clean frozen install when the identity changes or validation fails. Keep
+source staging separate from the dependency cache: an interrupted cleanup must not empty the cache
+while trying to remove stale ignored output.
+
+When a repository has a secondary `uv` toolchain, list each relative project directory in
+`REMOTE_RUNNER_UV_PROJECTS`. Sync its public lockfiles, rebuild `.venv` remotely with `uv sync
+--frozen`, and share only uv's download cache under the repository identity. Never sync or share
+the virtualenv: editable project installs retain the absolute source path that created them.
+
+After sync, reconstruct an isolated Git index from the tracked manifest on both Macs and compare the
+resulting tree IDs. Rsync success is transport evidence; equal tree IDs are source-identity evidence.
+Refuse before dependency setup or testing when they differ.
 
 If tests need only basic Git status, construct isolated snapshot metadata remotely. If they need
 history, tags, LFS or submodules, use a dedicated remote clone with explicit synchronisation or mark
@@ -187,10 +202,22 @@ Use:
 
 The locks provide mutual exclusion, not FIFO ordering. Probe once per second. Stay quiet for ten
 seconds, then print a short waiting message every ten seconds. Ensure locks release when their
-owning process exits or receives a signal.
+owning process exits or receives a signal. Put finite deadlines on local lock wait, remote lock wait,
+dependency setup and the test command. A deadline must terminate the whole process group, record its
+PID, elapsed time and a command-name-only process snapshot, then return a distinct infrastructure
+status. Do not log command arguments because they may contain secrets.
 
-Use the repository's worker setting when present. Otherwise start with the remote logical-core
-count. If that swaps or is slower, measure a smaller value and retain the faster stable setting.
+Use the repository's worker setting when present. Otherwise start with at most two workers and
+measure upward. A small Mac can become slower when six test workers compete with compiler and
+verifier children even when its logical-core count is higher.
+
+Use SSH keepalives as well as a connection timeout. Retry only preflight and idempotent sync steps;
+never retry a test automatically. Persist one remote log per job with phase markers for sync,
+dependency readiness, command start, deadline and terminal status. Keep a local started/completed/
+interrupted record so a lost client is classified instead of leaving a started-only ambiguity.
+The baseline writes the local lifecycle record to
+`~/.local/state/npm-remote-runner-macos/runs.log` and remote command logs under
+`~/Library/Caches/npm-remote-runner-macos/logs/`.
 
 ## Make normal use transparent
 
@@ -216,13 +243,17 @@ Check:
 4. the normal full test script;
 5. each safely split compound script;
 6. dependency reuse, then clean reinstallation for a different dependency identity;
-7. approved snapshot or coverage copy-back where applicable;
-8. two concurrent requests do not overlap and show the specified waiting cadence;
-9. an unrelated repository, nested repository and unselected worktree remain local;
-10. opted-in Claude Code and Codex worktrees route remotely, when such worktrees are available;
-11. routing survives a fresh login shell;
-12. any required application restart has been completed by the user;
-13. the remote test worker is active while no local test worker is running.
+7. two worktrees of one repository reuse one dependency identity without sharing source;
+8. stale ignored output is absent from the next source snapshot while dependency caches survive;
+9. a deliberately hung setup and test each reach their own deadline and leave no child process;
+10. a dropped SSH session cannot let the next sync replace source under a surviving test;
+11. approved snapshot or coverage copy-back where applicable;
+12. two concurrent requests do not overlap and show the specified waiting cadence;
+13. an unrelated repository, nested repository and unselected worktree remain local;
+14. opted-in Claude Code and Codex worktrees route remotely, when such worktrees are available;
+15. routing survives a fresh login shell;
+16. any required application restart has been completed by the user;
+17. the remote test worker is active while no local test worker is running.
 
 A remotely executed failing test proves routing, not repository correctness. Report test failures
 separately from runner failures.
@@ -234,7 +265,7 @@ Provide:
 - the final routing table;
 - confirmed remote identity without secrets;
 - installed personal file paths;
-- doctor, single-test, full-suite and removal commands;
+- doctor, single-test, full-suite, local/remote log and removal commands;
 - local and remote timings;
 - verification results and unsupported entry forms;
 - the exact rollback procedure.
