@@ -7,6 +7,9 @@ set -euo pipefail
 
 declare -a REMOTE_RUNNER_ALLOWED_ROOTS=()
 declare -a REMOTE_RUNNER_UNTRACKED_ALLOWLIST=()
+# Relative dirs with pyproject.toml + uv.lock. Virtualenvs are never synced;
+# each entry is installed remotely from its lockfile when the identity changes.
+declare -a REMOTE_RUNNER_UV_PROJECTS=()
 
 runner_config="${NPM_REMOTE_RUNNER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/npm-remote-runner-macos/config.sh}"
 if [[ -f "$runner_config" ]]; then
@@ -21,7 +24,13 @@ REMOTE_RUNNER_HOST="${REMOTE_RUNNER_HOST:-CHANGE_ME.local}"
 REMOTE_RUNNER_BASE_DIR="${REMOTE_RUNNER_BASE_DIR:-Library/Caches/npm-remote-runner-macos}"
 REMOTE_RUNNER_NODE_VERSION="${REMOTE_RUNNER_NODE_VERSION:-}"
 REMOTE_RUNNER_ALLOW_REGISTERED_WORKTREES="${REMOTE_RUNNER_ALLOW_REGISTERED_WORKTREES:-0}"
+REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC="${REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC:-0}"
 REMOTE_RUNNER_CONNECT_TIMEOUT="${REMOTE_RUNNER_CONNECT_TIMEOUT:-10}"
+REMOTE_RUNNER_CONNECT_ATTEMPTS="${REMOTE_RUNNER_CONNECT_ATTEMPTS:-3}"
+REMOTE_RUNNER_LOCAL_LOCK_TIMEOUT="${REMOTE_RUNNER_LOCAL_LOCK_TIMEOUT:-900}"
+REMOTE_RUNNER_REMOTE_LOCK_TIMEOUT="${REMOTE_RUNNER_REMOTE_LOCK_TIMEOUT:-900}"
+REMOTE_RUNNER_SETUP_TIMEOUT="${REMOTE_RUNNER_SETUP_TIMEOUT:-600}"
+REMOTE_RUNNER_JOB_TIMEOUT="${REMOTE_RUNNER_JOB_TIMEOUT:-1200}"
 REMOTE_RUNNER_SSH_KEY="${REMOTE_RUNNER_SSH_KEY:-}"
 
 usage() {
@@ -42,8 +51,14 @@ Example configuration:
     "/absolute/path/to/repository"
   )
   REMOTE_RUNNER_ALLOW_REGISTERED_WORKTREES=1
+  REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC=0
+  REMOTE_RUNNER_SETUP_TIMEOUT=600
+  REMOTE_RUNNER_JOB_TIMEOUT=1200
   REMOTE_RUNNER_UNTRACKED_ALLOWLIST=(
     "generated-public-fixtures/"
+  )
+  REMOTE_RUNNER_UV_PROJECTS=(
+    "tools/verifier"
   )
 
 Do not put passwords, tokens or environment values in this configuration.
@@ -57,6 +72,10 @@ fail() {
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || fail "missing local command: $1"
+}
+
+require_positive_integer() {
+  [[ "$2" =~ ^[1-9][0-9]*$ ]] || fail "$1 must be a positive integer"
 }
 
 canonical_directory() {
@@ -150,6 +169,15 @@ validate_configuration() {
   [[ "$REMOTE_RUNNER_ALLOW_REGISTERED_WORKTREES" == "0" ||
     "$REMOTE_RUNNER_ALLOW_REGISTERED_WORKTREES" == "1" ]] ||
     fail "REMOTE_RUNNER_ALLOW_REGISTERED_WORKTREES must be 0 or 1"
+  [[ "$REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC" == "0" ||
+    "$REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC" == "1" ]] ||
+    fail "REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC must be 0 or 1"
+  require_positive_integer REMOTE_RUNNER_CONNECT_TIMEOUT "$REMOTE_RUNNER_CONNECT_TIMEOUT"
+  require_positive_integer REMOTE_RUNNER_CONNECT_ATTEMPTS "$REMOTE_RUNNER_CONNECT_ATTEMPTS"
+  require_positive_integer REMOTE_RUNNER_LOCAL_LOCK_TIMEOUT "$REMOTE_RUNNER_LOCAL_LOCK_TIMEOUT"
+  require_positive_integer REMOTE_RUNNER_REMOTE_LOCK_TIMEOUT "$REMOTE_RUNNER_REMOTE_LOCK_TIMEOUT"
+  require_positive_integer REMOTE_RUNNER_SETUP_TIMEOUT "$REMOTE_RUNNER_SETUP_TIMEOUT"
+  require_positive_integer REMOTE_RUNNER_JOB_TIMEOUT "$REMOTE_RUNNER_JOB_TIMEOUT"
   case "$REMOTE_RUNNER_BASE_DIR" in
     Library/Caches/npm-remote-runner-macos | Library/Caches/npm-remote-runner-macos/*) ;;
     *) fail "REMOTE_RUNNER_BASE_DIR must stay under Library/Caches/npm-remote-runner-macos" ;;
@@ -166,6 +194,8 @@ build_ssh_configuration() {
   ssh_arguments=(
     -o BatchMode=yes
     -o "ConnectTimeout=$REMOTE_RUNNER_CONNECT_TIMEOUT"
+    -o ServerAliveInterval=15
+    -o ServerAliveCountMax=3
     -o ControlMaster=auto
     -o ControlPersist=600
     -o "ControlPath=/tmp/npm-remote-runner-%C"
@@ -189,6 +219,23 @@ require_local_tools() {
   done
 }
 
+retry_transport() {
+  local status=0
+  for ((attempt = 1; attempt <= REMOTE_RUNNER_CONNECT_ATTEMPTS; attempt += 1)); do
+    if "$@"; then
+      return 0
+    else
+      status=$?
+    fi
+    if ((attempt < REMOTE_RUNNER_CONNECT_ATTEMPTS)); then
+      printf "Transport attempt %s/%s failed; retrying.\n" \
+        "$attempt" "$REMOTE_RUNNER_CONNECT_ATTEMPTS" >&2
+      sleep "$attempt"
+    fi
+  done
+  return "$status"
+}
+
 is_protected_path() {
   local path="/$1"
   case "$path" in
@@ -201,6 +248,7 @@ is_protected_path() {
     */id_rsa | */id_dsa | */id_ecdsa | */id_ed25519) return 0 ;;
     */credentials.json | */credentials | */secrets.json | */secrets) return 0 ;;
     */.git | */.git/* | */node_modules | */node_modules/*) return 0 ;;
+    */.venv | */.venv/* | */.uv-cache | */.uv-cache/*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -225,10 +273,18 @@ build_manifests() {
 
   local path approved
   while IFS= read -r -d "" path; do
-    append_manifest_path "$path"
-    if ! is_protected_path "$path" &&
-      [[ -e "$workspace_root/$path" || -L "$workspace_root/$path" ]]; then
+    if [[ "/$path" == */.npmrc ]]; then
+      [[ "$REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC" == "1" ]] ||
+        fail "tracked $path is excluded unless REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC=1 confirms it contains no credentials"
+      [[ -e "$workspace_root/$path" || -L "$workspace_root/$path" ]] || continue
+      printf "%s\n" "$path" >>"$source_manifest_unsorted"
       printf "%s\0" "$path" >>"$tracked_manifest"
+    else
+      append_manifest_path "$path"
+      if ! is_protected_path "$path" &&
+        [[ -e "$workspace_root/$path" || -L "$workspace_root/$path" ]]; then
+        printf "%s\0" "$path" >>"$tracked_manifest"
+      fi
     fi
   done < <(git -C "$workspace_root" ls-files -z --cached)
 
@@ -242,11 +298,40 @@ build_manifests() {
 
   LC_ALL=C sort -u "$source_manifest_unsorted" -o "$source_manifest"
   [[ -s "$source_manifest" ]] || fail "source manifest is empty"
+
+  tracked_git_dir="$(mktemp -d "${TMPDIR:-/tmp}/npm-remote-git.XXXXXX")"
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    git init --bare -q "$tracked_git_dir"
+  tracked_index="$tracked_git_dir/index"
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_INDEX_FILE="$tracked_index" \
+    git --git-dir="$tracked_git_dir" --work-tree="$workspace_root" \
+    -c core.autocrlf=false -c core.safecrlf=false \
+    -c core.attributesFile=/dev/null read-tree --empty
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_INDEX_FILE="$tracked_index" \
+    git --git-dir="$tracked_git_dir" --work-tree="$workspace_root" \
+    -c core.autocrlf=false -c core.safecrlf=false \
+    -c core.attributesFile=/dev/null --literal-pathspecs \
+    add --pathspec-from-file="$tracked_manifest" --pathspec-file-nul
+  tracked_tree="$(
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_INDEX_FILE="$tracked_index" \
+      git --git-dir="$tracked_git_dir" --work-tree="$workspace_root" \
+      -c core.autocrlf=false -c core.safecrlf=false \
+      -c core.attributesFile=/dev/null write-tree
+  )"
+  tracked_identity="$(mktemp "${TMPDIR:-/tmp}/npm-remote-tree.XXXXXX")"
+  printf "%s\n" "$tracked_tree" >"$tracked_identity"
 }
 
 make_remote_slot() {
-  local workspace_name workspace_hash local_machine_identity
+  local workspace_name workspace_hash repository_hash repository_key repository_name local_machine_identity
   workspace_name="$(printf "%s" "$(basename "$workspace_root")" | tr -c "[:alnum:]._" "-")"
+  repository_key="$(git -C "$workspace_root" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$repository_key" ]]; then
+    repository_key="$(git_common_directory "$workspace_root")"
+  fi
+  repository_name="$(basename "${repository_key%.git}" | tr -c "[:alnum:]._" "-")"
+  repository_hash="$(printf "%s" "$repository_key" | shasum -a 256 | cut -c1-12)"
+  repository_cache_name="${repository_name}-${repository_hash}"
   local_machine_identity="$(
     printf "%s:%s" "$(id -u)" "$(scutil --get LocalHostName 2>/dev/null || hostname)"
   )"
@@ -256,11 +341,15 @@ make_remote_slot() {
   remote_slot_name="${workspace_name}-${workspace_hash}"
   remote_slot="${REMOTE_RUNNER_BASE_DIR}/${remote_slot_name}"
   local_lock_file="/tmp/npm-remote-runner-${workspace_hash}.lock"
+  job_id="$(date -u +%Y%m%dT%H%M%SZ)-${workspace_hash}-$$"
 }
 
 wait_for_local_lock() {
   local waited=0
   while ! shlock -f "$local_lock_file" -p "$$"; do
+    if ((waited >= REMOTE_RUNNER_LOCAL_LOCK_TIMEOUT)); then
+      fail "timed out waiting ${REMOTE_RUNNER_LOCAL_LOCK_TIMEOUT}s for the local runner lock"
+    fi
     sleep 1
     waited=$((waited + 1))
     if ((waited % 10 == 0)); then
@@ -274,7 +363,11 @@ cleanup() {
   [[ -z "${source_manifest:-}" ]] || rm -f "$source_manifest"
   [[ -z "${source_manifest_unsorted:-}" ]] || rm -f "$source_manifest_unsorted"
   [[ -z "${tracked_manifest:-}" ]] || rm -f "$tracked_manifest"
+  [[ -z "${tracked_index:-}" ]] || rm -f "$tracked_index"
+  [[ -z "${tracked_git_dir:-}" ]] || rm -rf "$tracked_git_dir"
+  [[ -z "${tracked_identity:-}" ]] || rm -f "$tracked_identity"
   [[ -z "${run_arguments_file:-}" ]] || rm -f "$run_arguments_file"
+  [[ -z "${uv_projects_file:-}" ]] || rm -f "$uv_projects_file"
 }
 
 doctor() {
@@ -411,11 +504,14 @@ rm -rf "$base/source.next"
 mkdir -p "$base/source.next"
 REMOTE
 
-  rsync -acz -e "$rsync_transport" \
+  retry_transport rsync -acz -e "$rsync_transport" \
     "$source_manifest" "$remote_target:$remote_slot/meta/source-manifest.next"
-  rsync -acz -e "$rsync_transport" \
+  retry_transport rsync -acz -e "$rsync_transport" \
     "$tracked_manifest" "$remote_target:$remote_slot/meta/tracked-manifest.next"
-  rsync -acz --files-from="$source_manifest" -e "$rsync_transport" \
+  retry_transport rsync -acz -e "$rsync_transport" \
+    "$tracked_identity" "$remote_target:$remote_slot/meta/tracked-tree.next"
+  retry_transport rsync -acz --checksum --delete-delay --delay-updates \
+    --files-from="$source_manifest" -e "$rsync_transport" \
     "$workspace_root/" "$remote_target:$remote_slot/source.next/"
 
   local checksum_difference
@@ -436,8 +532,26 @@ run_remote() {
   validate_configuration
   build_ssh_configuration
   make_remote_slot
+  if ! retry_transport ssh "${ssh_arguments[@]}" "$remote_target" true >/dev/null 2>&1; then
+    fail "remote host is unreachable; no sync or test started"
+  fi
   wait_for_local_lock
-  trap cleanup EXIT
+  local_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/npm-remote-runner-macos"
+  mkdir -p "$local_state_dir"
+  chmod 700 "$local_state_dir"
+  local_run_log="$local_state_dir/runs.log"
+  terminal_recorded=0
+  printf "%s job=%s state=started command=%s argumentCount=%s\n" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$job_id" "$1" "$#" >>"$local_run_log"
+  record_local_terminal() {
+    local status=$?
+    if [[ "${terminal_recorded:-0}" == "0" ]]; then
+      printf "%s job=%s state=interrupted status=%s\n" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$job_id" "$status" >>"$local_run_log"
+    fi
+    cleanup
+  }
+  trap record_local_terminal EXIT
   trap "exit 129" HUP
   trap "exit 130" INT
   trap "exit 143" TERM
@@ -446,15 +560,31 @@ run_remote() {
   prepare_remote_snapshot
   run_arguments_file="$(mktemp "${TMPDIR:-/tmp}/npm-remote-arguments.XXXXXX")"
   printf "%s\0" "$node_version" "$workspace_relative_directory" "$@" >"$run_arguments_file"
-  rsync -acz -e "$rsync_transport" \
+  retry_transport rsync -acz -e "$rsync_transport" \
     "$run_arguments_file" "$remote_target:$remote_slot/meta/run-arguments.next"
+  uv_projects_file="$(mktemp "${TMPDIR:-/tmp}/npm-remote-uv-projects.XXXXXX")"
+  : >"$uv_projects_file"
+  for uv_project in "${REMOTE_RUNNER_UV_PROJECTS[@]}"; do
+    [[ "$uv_project" != /* && "$uv_project" != ../* && "$uv_project" != */../* ]] ||
+      fail "unsafe REMOTE_RUNNER_UV_PROJECTS entry: $uv_project"
+    printf "%s\n" "$uv_project" >>"$uv_projects_file"
+  done
+  retry_transport rsync -acz -e "$rsync_transport" \
+    "$uv_projects_file" "$remote_target:$remote_slot/meta/uv-projects.next"
+  rm -f "$uv_projects_file"
+  uv_projects_file=""
 
   set +e
   ssh "${ssh_arguments[@]}" "$remote_target" \
-    "/bin/bash -s -- $REMOTE_RUNNER_BASE_DIR $remote_slot_name" <<'REMOTE'
+    "/bin/bash -s -- $REMOTE_RUNNER_BASE_DIR $remote_slot_name $repository_cache_name $REMOTE_RUNNER_REMOTE_LOCK_TIMEOUT $REMOTE_RUNNER_SETUP_TIMEOUT $REMOTE_RUNNER_JOB_TIMEOUT $job_id" <<'REMOTE'
 set -euo pipefail
 base_dir="$1"
 slot_name="$2"
+repository_cache_name="$3"
+remote_lock_timeout="$4"
+setup_timeout="$5"
+job_timeout="$6"
+job_id="$7"
 case "$base_dir" in
   Library/Caches/npm-remote-runner-macos | Library/Caches/npm-remote-runner-macos/*) ;;
   *) printf "Unsafe remote base: %s\n" "$base_dir" >&2; exit 2 ;;
@@ -466,6 +596,12 @@ esac
   printf "Unsafe remote slot: %s\n" "$slot_name" >&2
   exit 2
 }
+[[ "$repository_cache_name" =~ ^[A-Za-z0-9._-]+$ ]] ||
+  { printf "Unsafe repository cache name.\n" >&2; exit 2; }
+for value in "$remote_lock_timeout" "$setup_timeout" "$job_timeout"; do
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || { printf "Invalid runner deadline.\n" >&2; exit 2; }
+done
+[[ "$job_id" =~ ^[A-Za-z0-9._-]+$ ]] || { printf "Unsafe job identity.\n" >&2; exit 2; }
 
 runner_root="$HOME/$base_dir"
 canonical_root="$(cd "$runner_root" && pwd -P)"
@@ -481,6 +617,20 @@ canonical_base="$(cd "$base" && pwd -P)"
   { printf "Remote slot contains a symlink.\n" >&2; exit 2; }
 workspace="$base/source"
 next_workspace="$base/source.next"
+log_dir="$runner_root/logs"
+mkdir -p "$log_dir"
+chmod 700 "$log_dir"
+job_log="$log_dir/$job_id.log"
+printf "phase=remote-started time=%s pid=%s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" >>"$job_log"
+remote_terminal=0
+record_remote_terminal() {
+  local status=$?
+  if [[ "$remote_terminal" == "0" ]]; then
+    printf "phase=remote-exited time=%s status=%s\n" \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$status" >>"$job_log"
+  fi
+}
+trap record_remote_terminal EXIT HUP INT TERM
 [[ -d "$base/meta" && ! -L "$base/meta" ]] ||
   { printf "Remote metadata directory is unsafe.\n" >&2; exit 2; }
 [[ -d "$next_workspace" && ! -L "$next_workspace" ]] ||
@@ -516,6 +666,10 @@ clean_path="$node_bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local
 runner_home="$base/runtime-home"
 mkdir -p "$runner_home"
 chmod 700 "$runner_home"
+uv_download_cache="$runner_root/uv-cache/$repository_cache_name"
+[[ ! -L "$runner_root/uv-cache" && ! -L "$uv_download_cache" ]] ||
+  { printf "uv download cache path is unsafe.\n" >&2; exit 2; }
+mkdir -p "$uv_download_cache"
 clean_environment=(
   env -i
   "HOME=$runner_home"
@@ -524,6 +678,9 @@ clean_environment=(
   "PATH=$clean_path"
   "TMPDIR=${TMPDIR:-/tmp}"
   "LANG=en_US.UTF-8"
+  "GIT_CONFIG_GLOBAL=/dev/null"
+  "GIT_CONFIG_NOSYSTEM=1"
+  "UV_CACHE_DIR=$uv_download_cache"
 )
 
 # One test process at a time in this runner cache. The lock is released by the
@@ -537,6 +694,11 @@ chmod 600 "$lock_path"
 exec 9<>"$lock_path"
 waited=0
 while ! lockf -s -t 0 9; do
+  if ((waited >= remote_lock_timeout)); then
+    printf "Timed out waiting %ss for the remote runner lock.\n" "$remote_lock_timeout" >&2
+    ps -axo pid=,ppid=,pgid=,stat=,%cpu=,%mem=,etime=,comm= >&2 || true
+    exit 75
+  fi
   sleep 1
   waited=$((waited + 1))
   if ((waited % 10 == 0)); then
@@ -552,6 +714,7 @@ mv "$next_workspace" "$workspace"
 
 mv "$base/meta/source-manifest.next" "$base/meta/source-manifest"
 mv "$base/meta/tracked-manifest.next" "$base/meta/tracked-manifest"
+mv "$base/meta/tracked-tree.next" "$base/meta/tracked-tree"
 
 cd "$workspace"
 if [[ ! -d .git ]]; then
@@ -559,14 +722,142 @@ if [[ ! -d .git ]]; then
   "${clean_environment[@]}" git config user.name "Remote Test Runner"
   "${clean_environment[@]}" git config user.email "remote-test@fake.invalid"
 fi
-"${clean_environment[@]}" git read-tree --empty
-"${clean_environment[@]}" git --literal-pathspecs \
+"${clean_environment[@]}" git -c core.autocrlf=false -c core.safecrlf=false \
+  -c core.attributesFile=/dev/null read-tree --empty
+"${clean_environment[@]}" git -c core.autocrlf=false -c core.safecrlf=false \
+  -c core.attributesFile=/dev/null --literal-pathspecs \
   add --pathspec-from-file="$base/meta/tracked-manifest" --pathspec-file-nul
+expected_tree="$(<"$base/meta/tracked-tree")"
+actual_tree="$(
+  "${clean_environment[@]}" git -c core.autocrlf=false -c core.safecrlf=false \
+    -c core.attributesFile=/dev/null write-tree
+)"
+[[ "$actual_tree" == "$expected_tree" ]] || {
+  printf "Remote tracked tree differs: expected %s, got %s\n" "$expected_tree" "$actual_tree" >&2
+  exit 2
+}
+printf "phase=source-verified time=%s tree=%s\n" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$actual_tree" >>"$job_log"
 if ! "${clean_environment[@]}" git rev-parse --verify HEAD >/dev/null 2>&1 ||
   ! "${clean_environment[@]}" git diff --cached --quiet; then
   "${clean_environment[@]}" git -c core.hooksPath=/dev/null -c commit.gpgsign=false \
     commit -q --allow-empty -m "remote test snapshot"
 fi
+
+run_bounded() {
+  local seconds="$1"
+  shift
+  "$node_bin/node" - "$seconds" "$job_log" "$@" <<'NODE_DEADLINE'
+const { createWriteStream } = require("node:fs");
+const { spawn, spawnSync } = require("node:child_process");
+const [secondsText, logPath, command, ...args] = process.argv.slice(2);
+const startedAt = Date.now();
+const log = createWriteStream(logPath, { flags: "a" });
+const child = spawn(command, args, { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+let expired = false;
+let settled = false;
+let killTimer;
+const emit = (stream, value) => {
+  stream.write(value);
+  log.write(value);
+};
+const signalGroup = (signal = "SIGTERM") => {
+  if (child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch {}
+};
+const terminate = () => {
+  expired = true;
+  signalGroup();
+  killTimer = setTimeout(() => signalGroup("SIGKILL"), 5000);
+};
+process.stdout.once("error", terminate);
+process.stderr.once("error", terminate);
+for (const signal of ["SIGHUP", "SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    terminate();
+    process.exitCode = 128;
+  });
+}
+emit(
+  process.stderr,
+  `phase=command-started time=${new Date().toISOString()} pid=${child.pid} command=${JSON.stringify(command)} argumentCount=${args.length}\n`,
+);
+child.stdout.on("data", (chunk) => emit(process.stdout, chunk));
+child.stderr.on("data", (chunk) => emit(process.stderr, chunk));
+const timer = setTimeout(() => {
+  expired = true;
+  emit(process.stderr, `Command exceeded ${secondsText}s; process snapshot follows.\n`);
+  const snapshot = spawnSync(
+    "ps",
+    ["-axo", "pid=,ppid=,pgid=,stat=,%cpu=,%mem=,etime=,comm="],
+    { encoding: "utf8" },
+  );
+  const rows = (snapshot.stdout || "")
+    .split("\n")
+    .filter((row) => row.trim().split(/\s+/)[2] === String(child.pid))
+    .join("\n");
+  emit(process.stderr, `${rows || snapshot.stderr || "process group returned no rows"}\n`);
+  signalGroup();
+  killTimer = setTimeout(() => signalGroup("SIGKILL"), 5000);
+}, Number(secondsText) * 1000);
+child.once("error", (error) => {
+  if (settled) return;
+  settled = true;
+  clearTimeout(timer);
+  emit(process.stderr, `Command failed to start: ${error.message}\n`);
+  log.end(() => process.exit(2));
+});
+child.once("exit", (code, signal) => {
+  if (settled) return;
+  settled = true;
+  clearTimeout(timer);
+  if (killTimer !== undefined) clearTimeout(killTimer);
+  let status = expired ? 124 : (code ?? 2);
+  let checks = 0;
+  const finish = () => {
+    emit(
+      process.stderr,
+      `phase=command-completed time=${new Date().toISOString()} status=${status} signal=${signal ?? "none"} elapsedMs=${Date.now() - startedAt}\n`,
+    );
+    log.end(() => process.exit(status));
+  };
+  const reapGroup = () => {
+    signalGroup("SIGKILL");
+    let alive = false;
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, 0);
+      alive = child.pid !== undefined;
+    } catch {}
+    if (!alive) return finish();
+    checks += 1;
+    if (checks >= 50) {
+      status = 124;
+      emit(process.stderr, `Process group ${child.pid} survived SIGKILL for 5s.\n`);
+      return finish();
+    }
+    setTimeout(reapGroup, 100);
+  };
+  reapGroup();
+});
+NODE_DEADLINE
+}
+
+quiet_setup() {
+  local step_log status
+  step_log="$(mktemp /tmp/npm-remote-step.XXXXXX)"
+  if run_bounded "$setup_timeout" "$@" >"$step_log" 2>&1; then
+    cat "$step_log" >>"$job_log"
+    rm -f "$step_log"
+    return 0
+  fi
+  status=$?
+  cat "$step_log" >>"$job_log"
+  cat "$step_log" >&2
+  rm -f "$step_log"
+  return "$status"
+}
 
 [[ -f package.json && -f package-lock.json ]] || {
   printf "The baseline runner requires package.json and package-lock.json; adapt it for this repository.\n" >&2
@@ -575,25 +866,35 @@ fi
 
 dependency_identity="$(
   {
-    printf "identity-v2\nnode=%s\nnpm=%s\nos=%s\nos_version=%s\nkernel=%s\narch=%s\n" \
+    printf "identity-v3\nnode=%s\nnpm=%s\nos=%s\nos_version=%s\nkernel=%s\narch=%s\n" \
       "$("$node_bin/node" --version)" "$("${clean_environment[@]}" npm --version)" \
       "$(uname -s)" "$(sw_vers -productVersion)" "$(uname -r)" "$(uname -m)"
     shasum -a 256 package.json package-lock.json
+    while IFS= read -r -d "" tracked_path; do
+      if [[ "/$tracked_path" == */.npmrc ]]; then
+        printf "%s=" "$tracked_path"
+        shasum -a 256 "$tracked_path" | cut -d " " -f 1
+      fi
+    done <"$base/meta/tracked-manifest"
   } | shasum -a 256 | cut -d " " -f 1
 )"
-dependency_root="$base/dependencies/$dependency_identity"
-[[ ! -L "$base/dependencies" && ! -L "$dependency_root" ]] ||
+repository_dependency_root="$runner_root/dependencies/$repository_cache_name"
+dependency_root="$repository_dependency_root/$dependency_identity"
+[[ ! -L "$runner_root/dependencies" && ! -L "$repository_dependency_root" &&
+  ! -L "$dependency_root" ]] ||
   { printf "Dependency cache path is unsafe.\n" >&2; exit 2; }
-mkdir -p "$base/dependencies"
+mkdir -p "$repository_dependency_root"
 if [[ -d "$dependency_root/node_modules" && ! -L "$dependency_root/node_modules" ]]; then
   cp -cR "$dependency_root/node_modules" "$workspace/node_modules"
 fi
 if [[ ! -d node_modules ]] ||
-  ! "${clean_environment[@]}" npm ls --all --json >/dev/null 2>&1; then
+  ! run_bounded "$setup_timeout" "${clean_environment[@]}" npm ls --all --json \
+    >/dev/null 2>&1; then
   rm -rf node_modules
-  "${clean_environment[@]}" npm ci --no-audit --no-fund
-  "${clean_environment[@]}" npm ls --all --json >/dev/null
-  dependency_next="$base/dependencies/${dependency_identity}.next"
+  quiet_setup "${clean_environment[@]}" npm ci --no-audit --no-fund
+  run_bounded "$setup_timeout" "${clean_environment[@]}" npm ls --all --json \
+    >/dev/null 2>&1
+  dependency_next="$repository_dependency_root/${dependency_identity}.next"
   [[ ! -L "$dependency_next" ]] ||
     { printf "Dependency staging path is unsafe.\n" >&2; exit 2; }
   rm -rf "$dependency_next"
@@ -602,21 +903,56 @@ if [[ ! -d node_modules ]] ||
   rm -rf "$dependency_root"
   mv "$dependency_next" "$dependency_root"
 fi
+printf "phase=dependencies-ready time=%s identity=%s\n" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dependency_identity" >>"$job_log"
+
+# Secondary toolchains use one shared download cache, but never share a virtualenv:
+# uv project installs are editable by default and retain their source path.
+if [[ -f "$base/meta/uv-projects.next" ]]; then
+  mv "$base/meta/uv-projects.next" "$base/meta/uv-projects"
+fi
+if [[ -f "$base/meta/uv-projects" ]]; then
+  while IFS= read -r uv_project || [[ -n "$uv_project" ]]; do
+    [[ -n "$uv_project" ]] || continue
+    [[ "$uv_project" != /* && "$uv_project" != ../* && "$uv_project" != */../* ]] ||
+      { printf "Unsafe uv project path: %s\n" "$uv_project" >&2; exit 2; }
+    if [[ ! -f "$uv_project/pyproject.toml" || ! -f "$uv_project/uv.lock" ]]; then
+      printf "Configured uv project is missing pyproject.toml or uv.lock: %s\n" \
+        "$uv_project" >&2
+      exit 2
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+      printf "uv is required on the remote Mac for project %s\n" "$uv_project" >&2
+      exit 2
+    fi
+    rm -rf "$uv_project/.venv"
+    quiet_setup "${clean_environment[@]}" uv sync --project "$uv_project" --frozen
+    [[ -x "$uv_project/.venv/bin/python" ]] ||
+      { printf "uv sync did not produce a usable venv at %s/.venv\n" "$uv_project" >&2; exit 2; }
+  done <"$base/meta/uv-projects"
+fi
 
 if [[ -n "$relative_directory" ]]; then
   cd "$relative_directory"
 fi
 
 set +e
-"${clean_environment[@]}" caffeinate -i -- "${command_arguments[@]}"
+run_bounded "$job_timeout" "${clean_environment[@]}" caffeinate -i -- "${command_arguments[@]}"
 result=$?
 set -e
+printf "phase=remote-completed time=%s status=%s\n" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$result" >>"$job_log"
+remote_terminal=1
 exit "$result"
 REMOTE
   local result=$?
   set -e
 
   printf "copyback_status=disabled-in-baseline\n"
+  printf "remote_log=~/%s/logs/%s.log\n" "$REMOTE_RUNNER_BASE_DIR" "$job_id"
+  printf "%s job=%s state=completed status=%s\n" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$job_id" "$result" >>"$local_run_log"
+  terminal_recorded=1
   cleanup
   trap - EXIT HUP INT TERM
   return "$result"
