@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Generic npm- and Bun-on-macOS baseline. Copy this file to a personal tools
+# typescript-remote-runner-macos: a generic npm-, pnpm- and Bun-on-macOS baseline. Copy this file to a personal tools
 # directory and adapt the configuration and routing for each selected repository.
 
 set -euo pipefail
@@ -14,8 +14,19 @@ declare -a REMOTE_RUNNER_UV_PROJECTS=()
 # members of the root (for example a separately locked UI package). Each entry
 # is installed remotely with the same package manager after the root.
 declare -a REMOTE_RUNNER_PACKAGE_PROJECTS=()
+# NAME=VALUE entries added to the test command's otherwise empty environment,
+# typically a worker cap for the repository's own test runner. "{cpus}" in a
+# value becomes this job's CPU share. Never put credentials here.
+declare -a REMOTE_RUNNER_COMMAND_ENV=()
 
-runner_config="${NPM_REMOTE_RUNNER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/npm-remote-runner-macos/config.sh}"
+# The runner was called npm-remote-runner-macos before it supported Bun and pnpm;
+# its configuration variable and path are still honoured.
+runner_config="${TYPESCRIPT_REMOTE_RUNNER_CONFIG:-${NPM_REMOTE_RUNNER_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/typescript-remote-runner-macos/config.sh}}"
+legacy_runner_config="${XDG_CONFIG_HOME:-$HOME/.config}/npm-remote-runner-macos/config.sh"
+if [[ -z "${TYPESCRIPT_REMOTE_RUNNER_CONFIG:-}${NPM_REMOTE_RUNNER_CONFIG:-}" && ! -f "$runner_config" &&
+  -f "$legacy_runner_config" ]]; then
+  runner_config="$legacy_runner_config"
+fi
 if [[ -f "$runner_config" ]]; then
   # This is a user-owned shell configuration file. It must not come from a
   # cloned repository or another untrusted source.
@@ -25,9 +36,10 @@ fi
 
 REMOTE_RUNNER_USER="${REMOTE_RUNNER_USER:-CHANGE_ME}"
 REMOTE_RUNNER_HOST="${REMOTE_RUNNER_HOST:-CHANGE_ME.local}"
-REMOTE_RUNNER_BASE_DIR="${REMOTE_RUNNER_BASE_DIR:-Library/Caches/npm-remote-runner-macos}"
+REMOTE_RUNNER_BASE_DIR="${REMOTE_RUNNER_BASE_DIR:-Library/Caches/typescript-remote-runner-macos}"
 REMOTE_RUNNER_NODE_VERSION="${REMOTE_RUNNER_NODE_VERSION:-}"
 REMOTE_RUNNER_BUN_VERSION="${REMOTE_RUNNER_BUN_VERSION:-}"
+REMOTE_RUNNER_PNPM_VERSION="${REMOTE_RUNNER_PNPM_VERSION:-}"
 REMOTE_RUNNER_ALLOW_REGISTERED_WORKTREES="${REMOTE_RUNNER_ALLOW_REGISTERED_WORKTREES:-0}"
 REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC="${REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC:-0}"
 REMOTE_RUNNER_CONNECT_TIMEOUT="${REMOTE_RUNNER_CONNECT_TIMEOUT:-10}"
@@ -39,6 +51,9 @@ REMOTE_RUNNER_JOB_TIMEOUT="${REMOTE_RUNNER_JOB_TIMEOUT:-1200}"
 # Jobs from different worktrees that may run on the remote Mac at once. Jobs from
 # one worktree always run one at a time.
 REMOTE_RUNNER_REMOTE_CONCURRENCY="${REMOTE_RUNNER_REMOTE_CONCURRENCY:-1}"
+# When above 0, a job that holds its locks waits (within the remote lock
+# timeout) until the remote 1-minute load average is at or below this value.
+REMOTE_RUNNER_MAX_LOAD="${REMOTE_RUNNER_MAX_LOAD:-0}"
 REMOTE_RUNNER_SSH_KEY="${REMOTE_RUNNER_SSH_KEY:-}"
 
 usage() {
@@ -49,12 +64,18 @@ Usage:
   remote-runner.sh test [test arguments...]
   remote-runner.sh run -- <command> [arguments...]
 
-The package manager follows the lockfile: package-lock.json selects npm with an
-exact Node version, bun.lock or bun.lockb selects Bun with an exact Bun version.
-"test" runs "npm test -- ..." or "bun run test -- ..." accordingly.
+The package manager follows the lockfile: package-lock.json selects npm and
+pnpm-lock.yaml selects pnpm, both with an exact Node version; bun.lock or
+bun.lockb selects Bun with an exact Bun version. When several lockfiles exist,
+the packageManager field of package.json decides. "test" runs
+"npm test -- ...", "pnpm run test ..." or "bun run test -- ..." accordingly.
+
+Each job gets REMOTE_RUNNER_CPUS, the remote core count divided by
+REMOTE_RUNNER_REMOTE_CONCURRENCY. Cap the test runner's workers with it through
+REMOTE_RUNNER_COMMAND_ENV, for example VITEST_MAX_WORKERS={cpus}.
 
 Configuration defaults to:
-  ~/.config/npm-remote-runner-macos/config.sh
+  ~/.config/typescript-remote-runner-macos/config.sh
 
 Example configuration:
   REMOTE_RUNNER_USER="remote-user"
@@ -66,7 +87,11 @@ Example configuration:
   REMOTE_RUNNER_ALLOW_TRACKED_PUBLIC_NPMRC=0
   REMOTE_RUNNER_SETUP_TIMEOUT=600
   REMOTE_RUNNER_JOB_TIMEOUT=1200
-  REMOTE_RUNNER_REMOTE_CONCURRENCY=1
+  REMOTE_RUNNER_REMOTE_CONCURRENCY=2
+  REMOTE_RUNNER_MAX_LOAD=0
+  REMOTE_RUNNER_COMMAND_ENV=(
+    "VITEST_MAX_WORKERS={cpus}"
+  )
   REMOTE_RUNNER_UNTRACKED_ALLOWLIST=(
     "generated-public-fixtures/"
   )
@@ -77,7 +102,7 @@ Example configuration:
     "packages/ui"
   )
 
-Do not put passwords, tokens or environment values in this configuration.
+Do not put passwords, tokens or other secrets in this configuration.
 USAGE
 }
 
@@ -153,14 +178,38 @@ resolve_workspace() {
   workspace_relative_directory="${workspace_relative_directory#/}"
 }
 
+package_manager_field() {
+  sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"\([a-z]*\)@\([^"]*\)".*/\1 \2/p' \
+    "$workspace_root/package.json" 2>/dev/null | head -n 1
+}
+
 resolve_package_manager() {
-  if [[ -f "$workspace_root/package-lock.json" ]]; then
-    package_manager="npm"
-  elif [[ -f "$workspace_root/bun.lock" || -f "$workspace_root/bun.lockb" ]]; then
-    package_manager="bun"
-  else
-    fail "no package-lock.json, bun.lock or bun.lockb in $workspace_root; adapt the runner for this repository"
-  fi
+  local -a found=()
+  [[ ! -f "$workspace_root/package-lock.json" ]] || found+=("npm")
+  [[ ! -f "$workspace_root/pnpm-lock.yaml" ]] || found+=("pnpm")
+  [[ ! -f "$workspace_root/bun.lock" && ! -f "$workspace_root/bun.lockb" ]] || found+=("bun")
+  local declared
+  declared="$(package_manager_field)"
+  declared="${declared%% *}"
+  case "${#found[@]}" in
+    0) fail "no package-lock.json, pnpm-lock.yaml, bun.lock or bun.lockb in $workspace_root; adapt the runner for this repository" ;;
+    1) package_manager="${found[0]}" ;;
+    *)
+      [[ " ${found[*]} " == *" $declared "* ]] ||
+        fail "several lockfiles (${found[*]}) and no matching packageManager field in package.json"
+      package_manager="$declared"
+      ;;
+  esac
+}
+
+# The version pinned in package.json's packageManager field for $1, if any.
+# A trailing "+sha..." integrity suffix is ignored.
+declared_version_of() {
+  local field
+  field="$(package_manager_field)"
+  [[ "${field%% *}" == "$1" ]] || return 0
+  field="${field#* }"
+  printf "%s" "${field%%+*}"
 }
 
 resolve_bun_version() {
@@ -168,12 +217,7 @@ resolve_bun_version() {
   if [[ -z "$pin" && -f "$workspace_root/.bun-version" ]]; then
     IFS= read -r pin <"$workspace_root/.bun-version" || true
   fi
-  if [[ -z "$pin" ]]; then
-    pin="$(
-      sed -n 's/.*"packageManager"[[:space:]]*:[[:space:]]*"bun@\([^"]*\)".*/\1/p' \
-        "$workspace_root/package.json" 2>/dev/null | head -n 1
-    )"
-  fi
+  [[ -n "$pin" ]] || pin="$(declared_version_of bun)"
   pin="${pin#bun-v}"
   pin="${pin#v}"
   [[ "$pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
@@ -189,6 +233,14 @@ resolve_toolchain() {
   else
     resolve_node_version
     toolchain_version="$node_version"
+  fi
+  if [[ "$package_manager" == "pnpm" ]]; then
+    local pin="${REMOTE_RUNNER_PNPM_VERSION:-$(declared_version_of pnpm)}"
+    pin="${pin#v}"
+    [[ "$pin" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+      fail "set REMOTE_RUNNER_PNPM_VERSION or packageManager to an exact pnpm version"
+    # pnpm runs on Node, so its toolchain is the pair NODE+PNPM.
+    toolchain_version="$node_version+$pin"
   fi
 }
 
@@ -236,9 +288,12 @@ validate_configuration() {
   require_positive_integer REMOTE_RUNNER_REMOTE_CONCURRENCY "$REMOTE_RUNNER_REMOTE_CONCURRENCY"
   ((REMOTE_RUNNER_REMOTE_CONCURRENCY <= 16)) ||
     fail "REMOTE_RUNNER_REMOTE_CONCURRENCY must be at most 16"
+  [[ "$REMOTE_RUNNER_MAX_LOAD" =~ ^[0-9]+(\.[0-9]+)?$ ]] ||
+    fail "REMOTE_RUNNER_MAX_LOAD must be a non-negative number"
   case "$REMOTE_RUNNER_BASE_DIR" in
-    Library/Caches/npm-remote-runner-macos | Library/Caches/npm-remote-runner-macos/*) ;;
-    *) fail "REMOTE_RUNNER_BASE_DIR must stay under Library/Caches/npm-remote-runner-macos" ;;
+    Library/Caches/typescript-remote-runner-macos | Library/Caches/typescript-remote-runner-macos/* | \
+      Library/Caches/npm-remote-runner-macos | Library/Caches/npm-remote-runner-macos/*) ;;
+    *) fail "REMOTE_RUNNER_BASE_DIR must stay under Library/Caches/typescript-remote-runner-macos" ;;
   esac
   [[ "$REMOTE_RUNNER_BASE_DIR" =~ ^[A-Za-z0-9._/-]+$ ]] ||
     fail "REMOTE_RUNNER_BASE_DIR contains unsupported characters"
@@ -256,7 +311,7 @@ build_ssh_configuration() {
     -o ServerAliveCountMax=3
     -o ControlMaster=auto
     -o ControlPersist=600
-    -o "ControlPath=/tmp/npm-remote-runner-%C"
+    -o "ControlPath=/tmp/ts-remote-runner-%C"
   )
   if [[ -n "$REMOTE_RUNNER_SSH_KEY" ]]; then
     ssh_arguments+=(-i "$REMOTE_RUNNER_SSH_KEY" -o IdentitiesOnly=yes)
@@ -358,6 +413,36 @@ refuse_symlinked_parent() {
   done
 }
 
+# Names the runner itself sets, or that change how programs load or where they
+# look for credentials and configuration, cannot be overridden.
+command_environment_name_allowed() {
+  local upper
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+  upper="$(printf "%s" "$1" | tr "[:lower:]" "[:upper:]")"
+  case "$upper" in
+    HOME | PATH | USER | LOGNAME | SHELL | PWD | TMPDIR | LANG | LC_* | GIT_* | NPM_CONFIG_* | \
+      BUN_INSTALL* | UV_* | DYLD_* | LD_* | SSH_* | REMOTE_RUNNER_* | NODE_OPTIONS) return 1 ;;
+    *TOKEN* | *SECRET* | *PASSWORD* | *PASSWD* | *CREDENTIAL* | *API_KEY* | *APIKEY* | \
+      *PRIVATE* | *AUTH*) return 1 ;;
+  esac
+}
+
+write_command_environment() {
+  local entry name value
+  : >"$job_stage_dir/command-env"
+  for entry in "${REMOTE_RUNNER_COMMAND_ENV[@]}"; do
+    [[ "$entry" == *=* ]] || fail "REMOTE_RUNNER_COMMAND_ENV entries must be NAME=VALUE"
+    name="${entry%%=*}"
+    value="${entry#*=}"
+    command_environment_name_allowed "$name" ||
+      fail "REMOTE_RUNNER_COMMAND_ENV may not set $name"
+    [[ "$value" != *$'\n'* ]] || fail "REMOTE_RUNNER_COMMAND_ENV value for $name contains a newline"
+    printf "%s=%s\n" "$name" "$value" >>"$job_stage_dir/command-env"
+  done
+  ! contains_literal_secret "$job_stage_dir/command-env" ||
+    fail "REMOTE_RUNNER_COMMAND_ENV contains what looks like a literal credential"
+}
+
 warn_unlisted_package_projects() {
   # A tracked lockfile below the root that is not configured is usually a
   # separately locked package whose node_modules would otherwise be missing.
@@ -367,7 +452,8 @@ warn_unlisted_package_projects() {
       */node_modules/*) continue ;;
     esac
     case "$package_manager:/$path" in
-      npm:*/package-lock.json | npm:*/npm-shrinkwrap.json | bun:*/bun.lock | bun:*/bun.lockb) ;;
+      npm:*/package-lock.json | npm:*/npm-shrinkwrap.json | pnpm:*/pnpm-lock.yaml | \
+        bun:*/bun.lock | bun:*/bun.lockb) ;;
       *) continue ;;
     esac
     directory="$(dirname "$path")"
@@ -404,9 +490,9 @@ compute_tracked_tree() {
 
 build_manifests() {
   # Everything the remote job needs besides source travels in one directory.
-  job_stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/npm-remote-job.XXXXXX")"
+  job_stage_dir="$(mktemp -d "${TMPDIR:-/tmp}/ts-remote-job.XXXXXX")"
   source_manifest="$job_stage_dir/source-manifest"
-  source_manifest_unsorted="$(mktemp "${TMPDIR:-/tmp}/npm-remote-source-unsorted.XXXXXX")"
+  source_manifest_unsorted="$(mktemp "${TMPDIR:-/tmp}/ts-remote-source-unsorted.XXXXXX")"
   tracked_manifest="$job_stage_dir/tracked-manifest"
   : >"$source_manifest_unsorted"
   : >"$tracked_manifest"
@@ -445,7 +531,7 @@ build_manifests() {
   LC_ALL=C sort -u "$source_manifest_unsorted" -o "$source_manifest"
   [[ -s "$source_manifest" ]] || fail "source manifest is empty"
 
-  tracked_git_dir="$(mktemp -d "${TMPDIR:-/tmp}/npm-remote-git.XXXXXX")"
+  tracked_git_dir="$(mktemp -d "${TMPDIR:-/tmp}/ts-remote-git.XXXXXX")"
   GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
     git init --bare -q "$tracked_git_dir"
   tracked_tree="$(compute_tracked_tree)"
@@ -470,7 +556,7 @@ make_remote_slot() {
   )"
   remote_slot_name="${workspace_name}-${workspace_hash}"
   remote_slot="${REMOTE_RUNNER_BASE_DIR}/${remote_slot_name}"
-  local_lock_file="${TMPDIR:-/tmp}/npm-remote-runner-${workspace_hash}.lock"
+  local_lock_file="${TMPDIR:-/tmp}/typescript-remote-runner-${workspace_hash}.lock"
   job_id="$(date -u +%Y%m%dT%H%M%SZ)-${workspace_hash}-$$"
 }
 
@@ -506,7 +592,12 @@ toolchain_bin() {
       node_path="$(fnm exec --using "$2" -- node -p "process.execPath" 2>/dev/null)" || return 1
       dirname "$node_path"
       ;;
-    bun) printf "%s\n" "$HOME/Library/Caches/npm-remote-runner-macos-toolchains/bun-$2/bin" ;;
+    bun) printf "%s\n" "$HOME/Library/Caches/typescript-remote-runner-macos-toolchains/bun-$2/bin" ;;
+    # $2 is NODE+PNPM; the directory links both the pinned node and pnpm.
+    pnpm)
+      printf "%s\n" \
+        "$HOME/Library/Caches/typescript-remote-runner-macos-toolchains/pnpm-${2#*+}-node-${2%%+*}/bin"
+      ;;
     *) return 1 ;;
   esac
 }
@@ -514,6 +605,12 @@ toolchain_reported_version() {
   case "$1" in
     npm) "$2/node" --version 2>/dev/null | sed "s/^v//" ;;
     bun) "$2/bun" --version 2>/dev/null ;;
+    pnpm)
+      local node_reported pnpm_reported
+      node_reported="$("$2/node" --version 2>/dev/null | sed "s/^v//")" || return 1
+      pnpm_reported="$(PATH="$2:/usr/bin:/bin" "$2/pnpm" --version 2>/dev/null)" || return 1
+      printf "%s+%s\n" "$node_reported" "$pnpm_reported"
+      ;;
   esac
 }
 '
@@ -539,16 +636,18 @@ printf "arch=%s\n" "$(uname -m)"
 printf "logical_cores=%s\n" "$(sysctl -n hw.logicalcpu)"
 printf "memory_bytes=%s\n" "$(sysctl -n hw.memsize)"
 printf "free_disk=%s\n" "$(df -h "$HOME" | awk 'NR == 2 { print $4 }')"
+printf "cpus=%s memory_gb=%s load=%s\n" "$(sysctl -n hw.ncpu)" \
+  "$(( $(sysctl -n hw.memsize) / 1073741824 ))" "$(sysctl -n vm.loadavg | awk '{ print $2 }')"
 printf "rsync=%s\n" "$(command -v rsync || printf missing)"
 printf "caffeinate=%s\n" "$(command -v caffeinate || printf missing)"
 bin="$(toolchain_bin "$package_manager" "$version" || true)"
 reported="$(toolchain_reported_version "$package_manager" "$bin" || true)"
 printf "package_manager=%s\n" "$package_manager"
-if [[ "$package_manager" == "bun" ]]; then
-  printf "bun=%s\n" "${reported:-missing}"
-else
-  printf "node=%s\n" "${reported:-missing}"
-fi
+case "$package_manager" in
+  bun) printf "bun=%s\n" "${reported:-missing}" ;;
+  pnpm) printf "node+pnpm=%s\n" "${reported:-missing}" ;;
+  *) printf "node=%s\n" "${reported:-missing}" ;;
+esac
 if [[ "$reported" != "$version" ]]; then
   printf "status=toolchain-mismatch expected=%s; run bootstrap\n" "$version"
   exit 2
@@ -582,7 +681,7 @@ if [[ "$package_manager" == "bun" ]]; then
       x86_64) asset="bun-darwin-x64" ;;
       *) printf "Unsupported architecture for Bun: %s\n" "$(uname -m)" >&2; exit 2 ;;
     esac
-    download_dir="$(mktemp -d "${TMPDIR:-/tmp}/npm-remote-bun.XXXXXX")"
+    download_dir="$(mktemp -d "${TMPDIR:-/tmp}/ts-remote-bun.XXXXXX")"
     trap 'rm -rf "${download_dir:?}"' EXIT
     curl -fsSL --retry 3 -o "$download_dir/$asset.zip" \
       "https://github.com/oven-sh/bun/releases/download/bun-v$version/$asset.zip"
@@ -605,9 +704,31 @@ if ! command -v fnm >/dev/null 2>&1; then
   }
   brew install fnm
 fi
-fnm install "$version"
-bin="$(toolchain_bin npm "$version")"
-printf "installed=node-%s\n" "$(toolchain_reported_version npm "$bin")"
+node_version="${version%%+*}"
+fnm install "$node_version"
+node_bin="$(toolchain_bin npm "$node_version")"
+printf "installed=node-%s\n" "$(toolchain_reported_version npm "$node_bin")"
+
+if [[ "$package_manager" == "pnpm" ]]; then
+  # pnpm itself is installed once per version with the pinned Node's npm; the
+  # combined directory links that pnpm next to the pinned node.
+  pnpm_version="${version#*+}"
+  toolchains="$HOME/Library/Caches/typescript-remote-runner-macos-toolchains"
+  pnpm_prefix="$toolchains/pnpm-$pnpm_version"
+  if [[ "$(PATH="$node_bin:/usr/bin:/bin" "$pnpm_prefix/bin/pnpm" --version 2>/dev/null || true)" \
+    != "$pnpm_version" ]]; then
+    PATH="$node_bin:/usr/bin:/bin" "$node_bin/npm" install --global --no-audit --no-fund \
+      --prefix "$pnpm_prefix" "pnpm@$pnpm_version" >/dev/null
+  fi
+  bin="$(toolchain_bin pnpm "$version")"
+  mkdir -p "$bin"
+  ln -sfn "$node_bin/node" "$bin/node"
+  ln -sfn "$pnpm_prefix/bin/pnpm" "$bin/pnpm"
+  installed="$(toolchain_reported_version pnpm "$bin" || true)"
+  [[ "$installed" == "$version" ]] ||
+    { printf "pnpm toolchain %s did not install correctly (found %s).\n" "$version" "${installed:-none}" >&2; exit 2; }
+  printf "installed=node+pnpm-%s\n" "$installed"
+fi
 REMOTE
   } | ssh "${ssh_arguments[@]}" "$remote_target" \
     "/bin/bash -s -- $package_manager $toolchain_version"
@@ -624,7 +745,8 @@ slot_name="$2"
 job_id="$3"
 [[ "$job_id" =~ ^[A-Za-z0-9._-]+$ ]] || { printf "Unsafe job identity.\n" >&2; exit 2; }
 case "$base_dir" in
-  Library/Caches/npm-remote-runner-macos | Library/Caches/npm-remote-runner-macos/*) ;;
+  Library/Caches/typescript-remote-runner-macos | Library/Caches/typescript-remote-runner-macos/* | \
+    Library/Caches/npm-remote-runner-macos | Library/Caches/npm-remote-runner-macos/*) ;;
   *) printf "Unsafe remote base: %s\n" "$base_dir" >&2; exit 2 ;;
 esac
 case "/$base_dir/" in
@@ -737,7 +859,7 @@ run_remote() {
   fi
   wait_for_local_lock
   run_started_seconds="$SECONDS"
-  local_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/npm-remote-runner-macos"
+  local_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/typescript-remote-runner-macos"
   mkdir -p "$local_state_dir"
   chmod 700 "$local_state_dir"
   local_run_log="$local_state_dir/runs.log"
@@ -775,6 +897,7 @@ run_remote() {
       fail "unsafe REMOTE_RUNNER_PACKAGE_PROJECTS entry: $package_project"
     printf "%s\n" "$package_project" >>"$job_stage_dir/package-projects"
   done
+  write_command_environment
   warn_unlisted_package_projects
   prepare_remote_snapshot
   # The remote copy was verified against the files as they were after the
@@ -796,8 +919,12 @@ setup_timeout="$5"
 job_timeout="$6"
 job_id="$7"
 concurrency="$8"
+max_load="$9"
+[[ "$max_load" =~ ^[0-9]+(\.[0-9]+)?$ ]] ||
+  { printf "Unsafe remote load limit: %s\n" "$max_load" >&2; exit 2; }
 case "$base_dir" in
-  Library/Caches/npm-remote-runner-macos | Library/Caches/npm-remote-runner-macos/*) ;;
+  Library/Caches/typescript-remote-runner-macos | Library/Caches/typescript-remote-runner-macos/* | \
+    Library/Caches/npm-remote-runner-macos | Library/Caches/npm-remote-runner-macos/*) ;;
   *) printf "Unsafe remote base: %s\n" "$base_dir" >&2; exit 2 ;;
 esac
 case "/$base_dir/" in
@@ -864,9 +991,12 @@ package_manager="${run_values[0]}"
 toolchain_version="${run_values[1]}"
 relative_directory="${run_values[2]}"
 command_arguments=("${run_values[@]:3}")
-[[ "$package_manager" == "npm" || "$package_manager" == "bun" ]] ||
+[[ "$package_manager" == "npm" || "$package_manager" == "pnpm" || "$package_manager" == "bun" ]] ||
   { printf "Unsupported package manager: %s\n" "$package_manager" >&2; exit 2; }
-[[ "$toolchain_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+version_pattern='^[0-9]+\.[0-9]+\.[0-9]+$'
+[[ "$package_manager" != "pnpm" ]] ||
+  version_pattern='^[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+\.[0-9]+\.[0-9]+$'
+[[ "$toolchain_version" =~ $version_pattern ]] ||
   { printf "Unsupported toolchain version: %s\n" "$toolchain_version" >&2; exit 2; }
 
 [[ "$(uname -s)" == "Darwin" ]] || {
@@ -881,7 +1011,8 @@ if [[ -z "$toolchain_directory" || "$(toolchain_reported_version "$package_manag
     "$package_manager" "$toolchain_version" >&2
   exit 2
 fi
-# The deadline wrapper runs on the repository's own runtime: Node for npm, Bun for Bun.
+# The deadline wrapper runs on the repository's own runtime: Node for npm and
+# pnpm, Bun for Bun.
 if [[ "$package_manager" == "bun" ]]; then
   wrapper_runtime="$toolchain_directory/bun"
 else
@@ -901,6 +1032,10 @@ npm_download_cache="$runner_root/npm-cache"
 [[ ! -L "$npm_download_cache" ]] ||
   { printf "npm download cache path is unsafe.\n" >&2; exit 2; }
 mkdir -p "$npm_download_cache"
+pnpm_store="$runner_root/pnpm-store"
+[[ ! -L "$pnpm_store" ]] ||
+  { printf "pnpm store path is unsafe.\n" >&2; exit 2; }
+mkdir -p "$pnpm_store"
 bun_download_cache="$runner_root/bun-cache"
 [[ ! -L "$bun_download_cache" ]] ||
   { printf "Bun download cache path is unsafe.\n" >&2; exit 2; }
@@ -924,6 +1059,7 @@ install_environment=(
   "${clean_environment[@]}"
   "npm_config_cache=$npm_download_cache"
   "BUN_INSTALL_CACHE_DIR=$bun_download_cache"
+  "npm_config_store_dir=$pnpm_store"
 )
 
 prepare_lock_file() {
@@ -978,7 +1114,7 @@ reap_all_orphans() {
 
 lock_wait_tick() {
   if ((waited >= remote_lock_timeout)); then
-    printf "Timed out waiting %ss for the remote runner lock.\n" "$remote_lock_timeout" >&2
+    printf "Timed out after %ss: %s.\n" "$remote_lock_timeout" "$1" >&2
     ps -axo pid=,ppid=,pgid=,stat=,%cpu=,%mem=,etime=,comm= >&2 || true
     exit 75
   fi
@@ -1025,13 +1161,27 @@ done
 printf "phase=locks-acquired time=%s waitedSeconds=%s\n" \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$waited" >>"$job_log"
 
+# Optional admission by load: the slot is held while waiting, so the queue order
+# among waiting jobs is unchanged, and the total wait shares the lock timeout.
+load_average() {
+  sysctl -n vm.loadavg | awk '{ print $2 }'
+}
+if awk -v m="$max_load" 'BEGIN { exit !(m > 0) }'; then
+  while current_load="$(load_average)" &&
+    awk -v l="$current_load" -v m="$max_load" 'BEGIN { exit !(l > m) }'; do
+    lock_wait_tick "The remote Mac load average is $current_load, above $max_load"
+  done
+  printf "phase=load-admitted time=%s load=%s waitedSeconds=%s\n" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$current_load" "$waited" >>"$job_log"
+fi
+
 # Every run starts from the verified source snapshot. Dependencies are cloned
 # from a separate pristine cache below.
 [[ ! -L "$workspace" ]] || { printf "Remote workspace is a symlink.\n" >&2; exit 2; }
 rm -rf "${workspace:?}"
 mv "$next_workspace" "$workspace"
 for meta_name in source-manifest tracked-manifest tracked-tree run-arguments uv-projects \
-  package-projects; do
+  package-projects command-env; do
   mv "$job_stage/meta/$meta_name" "$base/meta/$meta_name"
 done
 rm -rf "${job_stage:?}"
@@ -1210,7 +1360,7 @@ run_bounded() {
 
 quiet_setup() {
   local step_log status
-  step_log="$(mktemp /tmp/npm-remote-step.XXXXXX)"
+  step_log="$(mktemp /tmp/ts-remote-step.XXXXXX)"
   status=0
   run_bounded "$setup_timeout" "$@" >"$step_log" 2>&1 || status=$?
   if [[ "$status" == "0" ]]; then
@@ -1229,6 +1379,7 @@ tracked_file_digests() {
   while IFS= read -r -d "" tracked_path; do
     case "/$tracked_path" in
       */package.json | */package-lock.json | */npm-shrinkwrap.json | */.npmrc | \
+        */pnpm-lock.yaml | */pnpm-workspace.yaml | */.pnpmfile.cjs | \
         */bun.lock | */bun.lockb | */bunfig.toml)
         printf "%s=" "$tracked_path"
         shasum -a 256 "$tracked_path" | cut -d " " -f 1
@@ -1237,19 +1388,21 @@ tracked_file_digests() {
   done <"$base/meta/tracked-manifest"
 }
 
-if [[ "$package_manager" == "npm" ]]; then
-  [[ -f package.json && -f package-lock.json ]] || {
-    printf "npm mode requires package.json and package-lock.json.\n" >&2
-    exit 2
-  }
-  package_manager_version="$("${clean_environment[@]}" npm --version)"
-else
-  [[ -f package.json && ( -f bun.lock || -f bun.lockb ) ]] || {
-    printf "Bun mode requires package.json and bun.lock or bun.lockb.\n" >&2
-    exit 2
-  }
-  package_manager_version="$toolchain_version"
-fi
+# True when directory $1 has a manifest and a lockfile of this package manager.
+has_package_lock() {
+  [[ -f "$1/package.json" ]] || return 1
+  case "$package_manager" in
+    npm) [[ -f "$1/package-lock.json" ]] ;;
+    pnpm) [[ -f "$1/pnpm-lock.yaml" ]] ;;
+    bun) [[ -f "$1/bun.lock" || -f "$1/bun.lockb" ]] ;;
+  esac
+}
+has_package_lock . ||
+  { printf "%s mode requires package.json and its lockfile.\n" "$package_manager" >&2; exit 2; }
+case "$package_manager" in
+  npm) package_manager_version="$("${clean_environment[@]}" npm --version)" ;;
+  *) package_manager_version="$toolchain_version" ;;
+esac
 # The root first, then each configured separately locked package.
 package_projects=(".")
 while IFS= read -r package_project || [[ -n "$package_project" ]]; do
@@ -1257,20 +1410,11 @@ while IFS= read -r package_project || [[ -n "$package_project" ]]; do
   [[ "$package_project" != /* && "$package_project" != ../* && "$package_project" != */../* &&
     "$package_project" != .. && "$package_project" != */.. ]] ||
     { printf "Unsafe package project path: %s\n" "$package_project" >&2; exit 2; }
-  if [[ "$package_manager" == "npm" ]]; then
-    [[ -f "$package_project/package.json" && -f "$package_project/package-lock.json" ]] || {
-      printf "Configured package project lacks package.json or package-lock.json: %s\n" \
-        "$package_project" >&2
-      exit 2
-    }
-  else
-    [[ -f "$package_project/package.json" &&
-      ( -f "$package_project/bun.lock" || -f "$package_project/bun.lockb" ) ]] || {
-      printf "Configured package project lacks package.json or a Bun lockfile: %s\n" \
-        "$package_project" >&2
-      exit 2
-    }
-  fi
+  has_package_lock "$package_project" || {
+    printf "Configured package project lacks package.json or a %s lockfile: %s\n" \
+      "$package_manager" "$package_project" >&2
+    exit 2
+  }
   package_projects+=("$package_project")
 done <"$base/meta/package-projects"
 
@@ -1406,6 +1550,9 @@ npm_clean_install() {
 bun_frozen_install() {
   quiet_setup "${install_environment[@]}" bun install --frozen-lockfile
 }
+pnpm_frozen_install() {
+  quiet_setup "${install_environment[@]}" pnpm install --frozen-lockfile
+}
 
 if [[ "$package_manager" == "npm" ]]; then
   if [[ "$dependency_cache_state" == "miss" ]] || ! in_package_projects npm_tree_valid; then
@@ -1416,14 +1563,16 @@ if [[ "$package_manager" == "npm" ]]; then
     save_dependency_cache
   fi
 else
-  # A frozen install over a restored tree is a fast consistency check that also
-  # repairs anything missing; if it fails, fall back to a clean install.
-  if [[ "$dependency_cache_state" == "hit" ]] && ! in_package_projects bun_frozen_install; then
+  # For Bun and pnpm, a frozen install over a restored tree is a fast
+  # consistency check that also repairs anything missing; if it fails, fall back
+  # to a clean install.
+  frozen_install="${package_manager}_frozen_install"
+  if [[ "$dependency_cache_state" == "hit" ]] && ! in_package_projects "$frozen_install"; then
     dependency_cache_state="invalid"
   fi
   if [[ "$dependency_cache_state" != "hit" ]]; then
     remove_module_directories
-    in_package_projects bun_frozen_install
+    in_package_projects "$frozen_install"
     save_dependency_cache
   fi
 fi
@@ -1459,8 +1608,28 @@ if [[ -n "$relative_directory" ]]; then
   cd "$relative_directory"
 fi
 
+# Each job's share of the remote cores, and the configured command variables.
+cpu_share=$(( $(sysctl -n hw.ncpu) / concurrency ))
+((cpu_share >= 1)) || cpu_share=1
+command_environment=("${clean_environment[@]}" "REMOTE_RUNNER_CPUS=$cpu_share")
+command_environment_names=""
+while IFS= read -r entry || [[ -n "$entry" ]]; do
+  [[ -n "$entry" ]] || continue
+  name="${entry%%=*}"
+  [[ "$entry" == *=* && "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$name" != REMOTE_RUNNER_* &&
+    "$name" != HOME && "$name" != PATH ]] ||
+    { printf "Unsafe command environment entry.\n" >&2; exit 2; }
+  value="${entry#*=}"
+  command_environment+=("$name=${value//\{cpus\}/$cpu_share}")
+  command_environment_names="$command_environment_names${command_environment_names:+,}$name"
+done <"$base/meta/command-env"
+# Names only: values stay out of the logs.
+printf "phase=command-environment cpus=%s names=%s\n" \
+  "$cpu_share" "${command_environment_names:-none}" >>"$job_log"
+printf "cpu_share=%s command_env=%s\n" "$cpu_share" "${command_environment_names:-none}" >&2
+
 set +e
-run_bounded "$job_timeout" "${clean_environment[@]}" caffeinate -i -- "${command_arguments[@]}"
+run_bounded "$job_timeout" "${command_environment[@]}" caffeinate -i -- "${command_arguments[@]}"
 result=$?
 set -e
 printf "phase=remote-completed time=%s status=%s\n" \
@@ -1469,7 +1638,7 @@ remote_terminal=1
 exit "$result"
 REMOTE
   } | ssh "${ssh_arguments[@]}" "$remote_target" \
-    "/bin/bash -s -- $REMOTE_RUNNER_BASE_DIR $remote_slot_name $repository_cache_name $REMOTE_RUNNER_REMOTE_LOCK_TIMEOUT $REMOTE_RUNNER_SETUP_TIMEOUT $REMOTE_RUNNER_JOB_TIMEOUT $job_id $REMOTE_RUNNER_REMOTE_CONCURRENCY"
+    "/bin/bash -s -- $REMOTE_RUNNER_BASE_DIR $remote_slot_name $repository_cache_name $REMOTE_RUNNER_REMOTE_LOCK_TIMEOUT $REMOTE_RUNNER_SETUP_TIMEOUT $REMOTE_RUNNER_JOB_TIMEOUT $job_id $REMOTE_RUNNER_REMOTE_CONCURRENCY $REMOTE_RUNNER_MAX_LOAD"
   local result=$?
   set -e
 
@@ -1514,11 +1683,12 @@ case "$task" in
   test)
     resolve_workspace
     resolve_package_manager
-    if [[ "$package_manager" == "bun" ]]; then
-      run_remote bun run test -- "$@"
-    else
-      run_remote npm test -- "$@"
-    fi
+    case "$package_manager" in
+      bun) run_remote bun run test -- "$@" ;;
+      # pnpm passes everything after the script name to the script as is.
+      pnpm) run_remote pnpm run test "$@" ;;
+      *) run_remote npm test -- "$@" ;;
+    esac
     ;;
   run)
     [[ "${1:-}" != "--" ]] || shift
