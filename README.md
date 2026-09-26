@@ -1,7 +1,7 @@
 # Configure a personal remote macOS test runner
 
 You are an implementation agent. Set up transparent remote test execution for one or more local
-Node.js repositories, using another Mac as the runner.
+Node.js or Bun repositories, using another Mac as the runner.
 
 Your first reply must contain exactly this question and nothing else:
 
@@ -9,9 +9,12 @@ Your first reply must contain exactly this question and nothing else:
 
 Wait for the answer before inspecting files or changing either computer.
 
-Use [`remote-runner.sh`](./remote-runner.sh) as the starting point. It deliberately supports an npm
-repository with `package-lock.json`; copy it into the user's personal tools and expand the installed
-copy only where the selected repositories require different behaviour. The baseline deliberately
+Use [`remote-runner.sh`](./remote-runner.sh) as the starting point. It supports an npm repository
+with `package-lock.json` (exact Node version from `REMOTE_RUNNER_NODE_VERSION`, `.nvmrc` or
+`.node-version`) and a Bun repository with `bun.lock` or `bun.lockb` (exact Bun version from
+`REMOTE_RUNNER_BUN_VERSION`, `.bun-version` or `packageManager`). Its `test` command runs
+`npm test -- …` or `bun run test -- …` to match. Copy it into the user's personal tools and expand
+the installed copy only where the selected repositories require different behaviour. The baseline deliberately
 does not copy test-written files back; add exact repository-specific paths, pre-run conflict checks
 and staged replacement before enabling snapshot or fixture updates.
 
@@ -69,7 +72,7 @@ Use key-based SSH. Never request, store or embed a password. Probe:
 - macOS version and architecture;
 - logical core count, memory and free disk space;
 - SSH reachability, sleep behaviour and `caffeinate`;
-- package manager, Node-version manager, Node, npm and rsync.
+- package manager, Node-version manager, Node, npm, Bun and rsync.
 
 If key-based SSH is not already working, stop for a manual setup checkpoint:
 
@@ -89,7 +92,10 @@ The agent may inspect or transfer a public key. It must never open, print, trans
 private key, enter a password on the user's behalf, or weaken host-key checking.
 
 After confirmation, install missing non-secret prerequisites. Ask before using `sudo`. Install the
-repository's pinned Node version and verify it through a non-interactive SSH login.
+repository's pinned Node or Bun version and verify it through a non-interactive SSH login. The
+baseline's `bootstrap` installs Node through fnm, and Bun from its official release archive into
+`~/Library/Caches/npm-remote-runner-macos-toolchains/bun-<version>/bin`, leaving any
+Homebrew Bun untouched.
 
 Use SSH batch mode, connection reuse and a short connection timeout. Treat connection failure as an
 infrastructure error, with no local fallback.
@@ -136,6 +142,17 @@ Do not open, print, log, commit or transfer:
 - keychains, cloud credentials or editor and agent credential stores;
 - user-level or authentication-bearing `.npmrc` files.
 
+Names alone cannot catch every secret. The baseline also scans approved untracked files and
+tracked `.npmrc` files for literal credentials (private-key blocks, common cloud, GitHub, GitLab,
+Slack, npm and API-key token shapes, and npm auth settings with literal values) and refuses to sync
+a file that matches, naming the file but never the match. Tracked files are not scanned, because
+they already live in Git history.
+
+Run remote commands with an explicit, minimal environment and a private, initially empty `HOME`
+under the runner's cache, never the remote user's own. Tests that inspect `$HOME` (for example to
+prove a sandbox refuses `~/.ssh`) therefore see an empty home; report such a failure as an
+environment-sensitive test, not as a runner fault, and do not fake the missing files.
+
 Tracked public templates such as `.env.example`, `.env.sample` and `.env.template` may be synced. A
 tracked project `.npmrc` may be synced only when it contains public settings or variable
 placeholders instead of literal credentials. The baseline fails closed on every tracked `.npmrc`.
@@ -166,15 +183,42 @@ For every configured worktree:
   syncing any of them;
 - exclude every ignored or unapproved untracked path;
 - exclude `.git`, `node_modules`, secrets, environment files, caches and virtual environments;
-- preserve symlinks as links and never follow them outside the worktree;
+- preserve symlinks as links and never follow them outside the worktree; refuse any path that lies
+  below a symlinked directory (a branch switch can turn a tracked directory into a link), because
+  rsync would follow that directory and send what it points at;
 - use deletion so removed local source does not survive remotely;
-- run a checksum-based dry run with identical filters and refuse on any remaining source difference.
+- run a checksum-based dry run with identical filters and refuse on any remaining source difference;
+- recompute the tracked tree after the upload and refuse when it changed, so a branch switch or
+  checkout during sync can never produce a remote snapshot that mixes two versions.
+
+The baseline stages every job into its own empty directory, `<slot>/jobs/<job-id>/`, so ignored
+output from earlier runs never reappears and a sync can never replace files under another job.
+`rsync --copy-dest` points at the previous snapshot, so unchanged files are copied on the remote Mac
+instead of over the network. The transfer uses rsync's size-and-time check, the checksum dry run
+then proves the result, and any file the quick check missed is resent by content once before the
+run is refused.
 
 Never copy `node_modules`. Derive a dependency identity from the operating system, architecture,
-exact Node and package-manager versions, manifests, lockfiles and public package configuration. Use
+exact runtime and package-manager versions, every tracked manifest, lockfile and public package
+configuration (`package.json`, `package-lock.json`, `bun.lock`, `bun.lockb`, `bunfig.toml`,
+`.npmrc`). The baseline caches every `node_modules` directory a workspace install creates, restores
+them as APFS copy-on-write clones, and shares npm's and Bun's download caches across worktrees.
+npm validates a restored tree with `npm ls`; Bun runs `bun install --frozen-lockfile` over it, which
+is a fast no-op when the tree is complete and repairs it otherwise. Use
 the package manager's clean frozen install when the identity changes or validation fails. Keep
 source staging separate from the dependency cache: an interrupted cleanup must not empty the cache
-while trying to remove stale ignored output.
+while trying to remove stale ignored output. A setup step that fails must fail the run as a runner
+failure; never let a failed install fall through to testing.
+
+Look for tracked lockfiles below the root that are not covered by the root install (a separately
+locked UI package, for example, which is not a workspace member). List each such directory in
+`REMOTE_RUNNER_PACKAGE_PROJECTS`; the baseline installs the root first and then each listed project
+with the same package manager, includes the list in the dependency identity, and warns about every
+unlisted tracked lockfile of the active package manager. Leave test-fixture lockfiles unlisted.
+
+Point npm and Bun at the shared download caches only for install steps. Run the command itself with
+the package manager's default cache under the private runtime home: a test that starts `bun` or
+`npm` inside its own sandbox must not depend on reaching a runner-wide cache path.
 
 When a repository has a secondary `uv` toolchain, list each relative project directory in
 `REMOTE_RUNNER_UV_PROJECTS`. Sync its public lockfiles, rebuild `.venv` remotely with `uv sync
@@ -195,10 +239,30 @@ copy its writes back atomically or refuse before execution.
 Use:
 
 - one process-scoped local lock per worktree;
-- one process-scoped remote lock by default;
+- one remote lock per worktree slot, plus one remote execution lock by default
+  (`REMOTE_RUNNER_REMOTE_CONCURRENCY` raises the number of worktrees that may run at once);
 - a separate remote directory per worktree;
 - dynamic ports when tests bind servers;
 - `caffeinate` while work runs.
+
+The remote locks are `flock(2)` locks on open descriptors, and the baseline passes both descriptors
+to the command's process group. A test that outlives its SSH session therefore keeps holding the
+locks, and no later sync can replace source under it. If the deadline wrapper itself dies, for
+example from SIGKILL, it leaves a record of the command's process group; a later job that finds the
+wrapper gone reaps that group instead of waiting forever. A record whose process-group ID has been
+reused is left alone.
+
+When the SSH client disconnects, the wrapper stops the command's group and records
+`stopReason=client-lost` (status 129), distinct from `stopReason=deadline` (status 124); the locks
+are released only once the group is gone.
+
+Branches never share a remote workspace: each worktree has its own slot, and one worktree switching
+branches between requests queues behind its own earlier request. What worktrees on different
+branches do share is a dependency cache entry when their dependency identity matches, so guard it:
+restore and publish an entry under a per-repository cache lock, stage every new entry under a
+job-unique name, keep an entry another job published while this one was installing, and never cache
+a tree containing an absolute symlink into the runner's directory (restored into another slot, it
+would load the other worktree's code).
 
 The locks provide mutual exclusion, not FIFO ordering. Probe once per second. Stay quiet for ten
 seconds, then print a short waiting message every ten seconds. Ensure locks release when their
@@ -215,6 +279,9 @@ Use SSH keepalives as well as a connection timeout. Retry only preflight and ide
 never retry a test automatically. Persist one remote log per job with phase markers for sync,
 dependency readiness, command start, deadline and terminal status. Keep a local started/completed/
 interrupted record so a lost client is classified instead of leaving a started-only ambiguity.
+After each run the baseline prints `outcome=passed`, `command-failed`, `command-deadline` or
+`runner-failure`: only a command that ran to completion leaves a `remote-completed` marker in the
+job log, so a runner failure is never reported as a test failure.
 The baseline writes the local lifecycle record to
 `~/.local/state/npm-remote-runner-macos/runs.log` and remote command logs under
 `~/Library/Caches/npm-remote-runner-macos/logs/`.
@@ -248,7 +315,8 @@ Check:
 9. a deliberately hung setup and test each reach their own deadline and leave no child process;
 10. a dropped SSH session cannot let the next sync replace source under a surviving test;
 11. approved snapshot or coverage copy-back where applicable;
-12. two concurrent requests do not overlap and show the specified waiting cadence;
+12. two concurrent requests do not overlap and show the specified waiting cadence, and two worktrees
+    on different branches that miss the same dependency identity at once publish one intact entry;
 13. an unrelated repository, nested repository and unselected worktree remain local;
 14. opted-in Claude Code and Codex worktrees route remotely, when such worktrees are available;
 15. routing survives a fresh login shell;
