@@ -515,12 +515,17 @@ make_dir() {
 runner_root="$HOME/$base_dir"
 make_dir "$runner_root"
 chmod 700 "$runner_root"
-# Claim only an empty directory; mkdir decides between concurrent first runs.
-marker="$runner_root/.npm-remote-runner-owned"
+# Claim only an empty directory; mkdir decides between concurrent first runs. A cache claimed under
+# the old npm-remote-runner-macos name keeps its ownership.
+marker="$runner_root/.typescript-remote-runner-owned"
+legacy_marker="$runner_root/.npm-remote-runner-owned"
+if [[ ! -e "$marker" && -f "$legacy_marker" && ! -L "$legacy_marker" ]]; then
+  : >"$marker"
+fi
 if [[ ! -e "$marker" ]]; then
   if mkdir "$runner_root/.initializing" 2>/dev/null; then
     if [[ -n "$(find "$runner_root" -mindepth 1 -maxdepth 1 ! -name .initializing \
-      ! -name .npm-remote-runner-owned -print -quit)" ]]; then
+      ! -name .typescript-remote-runner-owned -print -quit)" ]]; then
       rmdir "$runner_root/.initializing"
       fail "remote cache is non-empty and has no ownership marker: $runner_root"
     fi
@@ -617,7 +622,7 @@ for directory in "$runner_root" "$slot" "$slot/meta" "$slot/jobs" "$job_stage" "
   "$job_stage/source"; do
   real_dir "$directory"
 done
-[[ -f "$runner_root/.npm-remote-runner-owned" && ! -L "$runner_root/.npm-remote-runner-owned" ]] ||
+[[ -f "$runner_root/.typescript-remote-runner-owned" && ! -L "$runner_root/.typescript-remote-runner-owned" ]] ||
   fail "remote cache ownership marker is missing"
 make_dir "$runner_root/logs"
 chmod 700 "$runner_root/logs"
