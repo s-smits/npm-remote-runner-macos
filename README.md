@@ -1,7 +1,14 @@
-# Configure a personal remote macOS test runner
+# typescript-remote-runner-macos
+
+Run the tests of npm, pnpm and Bun repositories on another Mac over SSH, transparently and without
+copying `node_modules` or secrets. This README is the setup prompt for an implementation agent;
+[`remote-runner.sh`](./remote-runner.sh) is the baseline it adapts. (Formerly
+`npm-remote-runner-macos`; the old configuration path and `NPM_REMOTE_RUNNER_CONFIG` still work.)
+
+## Configure a personal remote macOS test runner
 
 You are an implementation agent. Set up transparent remote test execution for one or more local
-Node.js or Bun repositories, using another Mac as the runner.
+Node.js (npm or pnpm) or Bun repositories, using another Mac as the runner.
 
 Your first reply must contain exactly this question and nothing else:
 
@@ -10,10 +17,12 @@ Your first reply must contain exactly this question and nothing else:
 Wait for the answer before inspecting files or changing either computer.
 
 Use [`remote-runner.sh`](./remote-runner.sh) as the starting point. It supports an npm repository
-with `package-lock.json` (exact Node version from `REMOTE_RUNNER_NODE_VERSION`, `.nvmrc` or
-`.node-version`) and a Bun repository with `bun.lock` or `bun.lockb` (exact Bun version from
-`REMOTE_RUNNER_BUN_VERSION`, `.bun-version` or `packageManager`). Its `test` command runs
-`npm test -- …` or `bun run test -- …` to match. Copy it into the user's personal tools and expand
+with `package-lock.json` and a pnpm repository with `pnpm-lock.yaml` (exact Node version from
+`REMOTE_RUNNER_NODE_VERSION`, `.nvmrc` or `.node-version`; exact pnpm version from
+`REMOTE_RUNNER_PNPM_VERSION` or `packageManager`), and a Bun repository with `bun.lock` or
+`bun.lockb` (exact Bun version from `REMOTE_RUNNER_BUN_VERSION`, `.bun-version` or
+`packageManager`). When several lockfiles exist, `packageManager` decides. Its `test` command runs
+`npm test -- …`, `pnpm run test …` or `bun run test -- …` to match. Copy it into the user's personal tools and expand
 the installed copy only where the selected repositories require different behaviour. The baseline deliberately
 does not copy test-written files back; add exact repository-specific paths, pre-run conflict checks
 and staged replacement before enabling snapshot or fixture updates.
@@ -72,7 +81,7 @@ Use key-based SSH. Never request, store or embed a password. Probe:
 - macOS version and architecture;
 - logical core count, memory and free disk space;
 - SSH reachability, sleep behaviour and `caffeinate`;
-- package manager, Node-version manager, Node, npm, Bun and rsync.
+- package manager, Node-version manager, Node, npm, pnpm, Bun and rsync.
 
 If key-based SSH is not already working, stop for a manual setup checkpoint:
 
@@ -93,9 +102,11 @@ private key, enter a password on the user's behalf, or weaken host-key checking.
 
 After confirmation, install missing non-secret prerequisites. Ask before using `sudo`. Install the
 repository's pinned Node or Bun version and verify it through a non-interactive SSH login. The
-baseline's `bootstrap` installs Node through fnm, and Bun from its official release archive into
-`~/Library/Caches/npm-remote-runner-macos-toolchains/bun-<version>/bin`, leaving any
-Homebrew Bun untouched.
+baseline's `bootstrap` installs Node through fnm; pnpm with the pinned Node's npm into
+`~/Library/Caches/typescript-remote-runner-macos-toolchains/pnpm-<version>`, linked next to that
+Node in `pnpm-<version>-node-<version>/bin`; and Bun from its official release archive into
+`~/Library/Caches/typescript-remote-runner-macos-toolchains/bun-<version>/bin`. It leaves any
+Homebrew Node, pnpm or Bun untouched.
 
 Use SSH batch mode, connection reuse and a short connection timeout. Treat connection failure as an
 infrastructure error, with no local fallback.
@@ -202,9 +213,10 @@ Never copy `node_modules`. Derive a dependency identity from the operating syste
 exact runtime and package-manager versions, every tracked manifest, lockfile and public package
 configuration (`package.json`, `package-lock.json`, `bun.lock`, `bun.lockb`, `bunfig.toml`,
 `.npmrc`). The baseline caches every `node_modules` directory a workspace install creates, restores
-them as APFS copy-on-write clones, and shares npm's and Bun's download caches across worktrees.
-npm validates a restored tree with `npm ls`; Bun runs `bun install --frozen-lockfile` over it, which
-is a fast no-op when the tree is complete and repairs it otherwise. Use
+them as APFS copy-on-write clones, and shares npm's and Bun's download caches and pnpm's store across
+worktrees (pnpm's `pnpm-lock.yaml`, `pnpm-workspace.yaml` and `.pnpmfile.cjs` also enter the
+identity). npm validates a restored tree with `npm ls`; Bun and pnpm run their frozen install over
+it, which is a fast no-op when the tree is complete and repairs it otherwise. Use
 the package manager's clean frozen install when the identity changes or validation fails. Keep
 source staging separate from the dependency cache: an interrupted cleanup must not empty the cache
 while trying to remove stale ignored output. A setup step that fails must fail the run as a runner
@@ -216,7 +228,7 @@ locked UI package, for example, which is not a workspace member). List each such
 with the same package manager, includes the list in the dependency identity, and warns about every
 unlisted tracked lockfile of the active package manager. Leave test-fixture lockfiles unlisted.
 
-Point npm and Bun at the shared download caches only for install steps. Run the command itself with
+Point npm, pnpm and Bun at the shared download caches and store only for install steps. Run the command itself with
 the package manager's default cache under the private runtime home: a test that starts `bun` or
 `npm` inside its own sandbox must not depend on reaching a runner-wide cache path.
 
@@ -275,6 +287,20 @@ Use the repository's worker setting when present. Otherwise start with at most t
 measure upward. A small Mac can become slower when six test workers compete with compiler and
 verifier children even when its logical-core count is higher.
 
+Worker caps are runner-specific (Jest and Vitest take `--maxWorkers`, `bun test` takes
+`--parallel`, and wrapper scripts often read their own variable), so the baseline does not guess.
+It gives every command `REMOTE_RUNNER_CPUS`, the remote core count divided by
+`REMOTE_RUNNER_REMOTE_CONCURRENCY`, and adds `REMOTE_RUNNER_COMMAND_ENV` entries such as
+`VITEST_MAX_WORKERS={cpus}` to the command's otherwise empty environment, with `{cpus}` replaced by
+that share. It refuses entries that would override the runner's own variables, loader or
+toolchain settings, names that suggest credentials, and values that look like literal tokens, and
+logs variable names only. Find the repository's own knob during inspection and set it here.
+
+`REMOTE_RUNNER_MAX_LOAD` (off at `0`) additionally holds a job that already has its slot until the
+remote 1-minute load average is at or below the limit, printing the waiting message and sharing
+the remote lock timeout, so work started outside the runner is not overcommitted either.
+`doctor` prints the remote core count, memory and current load to choose these values.
+
 Use SSH keepalives as well as a connection timeout. Retry only preflight and idempotent sync steps;
 never retry a test automatically. Persist one remote log per job with phase markers for sync,
 dependency readiness, command start, deadline and terminal status. Keep a local started/completed/
@@ -283,8 +309,8 @@ After each run the baseline prints `outcome=passed`, `command-failed`, `command-
 `runner-failure`: only a command that ran to completion leaves a `remote-completed` marker in the
 job log, so a runner failure is never reported as a test failure.
 The baseline writes the local lifecycle record to
-`~/.local/state/npm-remote-runner-macos/runs.log` and remote command logs under
-`~/Library/Caches/npm-remote-runner-macos/logs/`.
+`~/.local/state/typescript-remote-runner-macos/runs.log` and remote command logs under
+`~/Library/Caches/typescript-remote-runner-macos/logs/`.
 
 ## Make normal use transparent
 
@@ -304,7 +330,7 @@ Use existing tests and avoid product-source changes made only for verification.
 
 Check:
 
-1. remote identity and exact Node version;
+1. remote identity and exact Node, pnpm or Bun version;
 2. byte-identical source after sync;
 3. one single test through every supported entry form;
 4. the normal full test script;
